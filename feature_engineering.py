@@ -88,9 +88,8 @@ def extract_matminer_features(df, batch_size=500, use_top5_only=True):
         use_top5_only: 是否只提取 Top-5 特征（默认 True）
     """
     from matminer.featurizers.composition import ElementProperty
-    from matminer.featurizers.structure import GlobalSymmetryFeatures
 
-    print(f"使用 matminer 提取特征（Top-5 + SpaceGroupNumber）...")
+    print(f"使用 matminer 提取特征（仅 Magpie Top-5 对应属性）...")
 
     # 分批解析 Structure 对象（边解析边处理，不全部缓存）
     import json
@@ -99,18 +98,14 @@ def extract_matminer_features(df, batch_size=500, use_top5_only=True):
     
     print(f"  总样本数: {n_samples} | 分批大小: {batch_size} | 批次数: {n_batches}")
 
-    # 初始化 featurizer
-    # Magpie: NpValence, Column, GSmagmom × mean/max/range/avg_dev = 12 个特征
+    # 初始化 featurizer：3 种属性 × 4 种统计量 = 12 个特征
     elem_prop_feat = ElementProperty(
         data_source="magpie",
         features=["NpValence", "Column", "GSmagmom"],
         stats=["mean", "maximum", "range", "avg_dev"]
     )
-    # 空间群号: GlobalSymmetryFeatures 只有 spacegroup_number 有用
-    symmetry_feat = GlobalSymmetryFeatures()
 
-    all_magpie_results = []
-    all_symmetry_results = []
+    all_results = []
     all_indices = []
 
     for batch_idx in range(n_batches):
@@ -140,30 +135,18 @@ def extract_matminer_features(df, batch_size=500, use_top5_only=True):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             compositions = [s.composition for s in batch_structs]
-            
-            # 1. Magpie 组成特征
             elem_prop_feat.fit(compositions)
-            batch_magpie = elem_prop_feat.featurize_many(compositions, ignore_errors=True)
-            
-            # 2. 空间群号特征
-            symmetry_feat.fit(batch_structs)
-            batch_symmetry = symmetry_feat.featurize_many(batch_structs, ignore_errors=True)
+            batch_features = elem_prop_feat.featurize_many(compositions, ignore_errors=True)
 
-        all_magpie_results.append(batch_magpie)
-        all_symmetry_results.append(batch_symmetry)
+        all_results.append(batch_features)
         all_indices.extend(batch_valid_indices)
         
         print(f"  批次 {batch_idx + 1}/{n_batches}: 处理了 {len(batch_structs)} 个样本")
 
     # 合并所有批次结果
-    magpie_arr = np.vstack(all_magpie_results) if all_magpie_results else np.array([]).reshape(0, 12)
-    sym_arr = np.vstack(all_symmetry_results) if all_symmetry_results else np.array([]).reshape(0, 5)
-    feature_array = np.hstack([magpie_arr, sym_arr])
-
-    magpie_labels = elem_prop_feat.feature_labels()
-    sym_labels = symmetry_feat.feature_labels()
-    feature_labels = magpie_labels + sym_labels
-    print(f"  提取完成: {len(feature_labels)} 个特征（Magpie: {len(magpie_labels)}, Symmetry: {len(sym_labels)}）")
+    feature_array = np.vstack(all_results) if all_results else np.array([]).reshape(0, 12)
+    feature_labels = elem_prop_feat.feature_labels()
+    print(f"  提取完成: {len(feature_labels)} 个特征")
 
     # 构建 DataFrame
     matminer_df = pd.DataFrame(feature_array, columns=feature_labels, index=all_indices)
