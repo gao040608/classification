@@ -65,78 +65,108 @@ def extract_pymatgen_features(pymatgen_str):
     return features
 
 # ============================================================
-# matminer 一键特征提取
+# matminer 一键特征提取（优化版：分批 + 只提取 Top-5 特征）
 # ============================================================
-def extract_matminer_features(df):
+# Top-5 Magpie 特征（根据 XGBoost 特征重要性）
+TOP5_MAGPIE_FEATURES = [
+    "mean NpValence",
+    "maximum SpaceGroupNumber", 
+    "range Column",
+    "maximum GSmagmom",
+    "avg_dev GSmagmom"
+]
+
+def extract_matminer_features(df, batch_size=500, use_top5_only=True):
     """
-    使用 matminer 自动提取 140 个特征：
-    - DensityFeatures: 3 个（密度、每原子体积、堆积分数）
-    - GlobalSymmetryFeatures: 5 个（空间群号、晶系、是否中心对称、对称操作数）
-    - ElementProperty(magpie): 132 个（22 种元素属性 × 6 种统计量）
+    使用 matminer 自动提取特征（优化版）：
+    - 分批处理，避免 MemoryError
+    - 默认只提取 Top-5 Magpie 特征，大幅降低内存和 CPU 占用
+    
+    参数:
+        df: 输入 DataFrame
+        batch_size: 每批处理的样本数，默认 500
+        use_top5_only: 是否只提取 Top-5 特征（默认 True）
     """
-    from matminer.featurizers.structure import GlobalSymmetryFeatures, DensityFeatures
     from matminer.featurizers.composition import ElementProperty
+    from matminer.featurizers.structure import GlobalSymmetryFeatures
 
-    print("使用 matminer 自动提取特征（140 个）...")
+    print(f"使用 matminer 提取特征（Top-5 + SpaceGroupNumber）...")
 
-    # 解析所有 Structure 对象
+    # 分批解析 Structure 对象（边解析边处理，不全部缓存）
     import json
-    structures = []
-    for s in df['pymatgen_dict']:
-        if pd.isna(s):
-            structures.append(None)
-        else:
+    n_samples = len(df)
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    
+    print(f"  总样本数: {n_samples} | 分批大小: {batch_size} | 批次数: {n_batches}")
+
+    # 初始化 featurizer
+    # Magpie: NpValence, Column, GSmagmom × mean/max/range/avg_dev = 12 个特征
+    elem_prop_feat = ElementProperty(
+        data_source="magpie",
+        features=["NpValence", "Column", "GSmagmom"],
+        stats=["mean", "maximum", "range", "avg_dev"]
+    )
+    # 空间群号: GlobalSymmetryFeatures 只有 spacegroup_number 有用
+    symmetry_feat = GlobalSymmetryFeatures()
+
+    all_magpie_results = []
+    all_symmetry_results = []
+    all_indices = []
+
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, n_samples)
+        
+        # 解析当前批次的 Structure
+        batch_structs = []
+        batch_valid_indices = []
+        
+        for i in range(start_idx, end_idx):
+            s = df['pymatgen_dict'].iloc[i]
+            if pd.isna(s):
+                continue
             try:
                 d = json.loads(s)
-                structures.append(Structure.from_dict(d))
+                struct = Structure.from_dict(d)
+                batch_structs.append(struct)
+                batch_valid_indices.append(i)
             except:
-                structures.append(None)
+                continue
+        
+        if not batch_structs:
+            continue
 
-    # 构建 featurizer
-    # 注意：ElementProperty.from_preset("magpie") 需要 Composition 对象，
-    # pymatgen 新版本中 Structure 没有 element_composition 属性，
-    # 因此单独对 composition 做特征提取
-    density_feat = DensityFeatures()
-    symmetry_feat = GlobalSymmetryFeatures()
-    elem_prop_feat = ElementProperty.from_preset("magpie")
+        # 提取当前批次的特征
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compositions = [s.composition for s in batch_structs]
+            
+            # 1. Magpie 组成特征
+            elem_prop_feat.fit(compositions)
+            batch_magpie = elem_prop_feat.featurize_many(compositions, ignore_errors=True)
+            
+            # 2. 空间群号特征
+            symmetry_feat.fit(batch_structs)
+            batch_symmetry = symmetry_feat.featurize_many(batch_structs, ignore_errors=True)
 
-    # 对每个结构提取特征
-    valid_indices = [i for i, s in enumerate(structures) if s is not None]
-    valid_structs = [structures[i] for i in valid_indices]
+        all_magpie_results.append(batch_magpie)
+        all_symmetry_results.append(batch_symmetry)
+        all_indices.extend(batch_valid_indices)
+        
+        print(f"  批次 {batch_idx + 1}/{n_batches}: 处理了 {len(batch_structs)} 个样本")
 
-    print(f"  有效结构数: {len(valid_structs)} / {len(df)}")
-    print(f"  正在提取特征，请稍候...")
+    # 合并所有批次结果
+    magpie_arr = np.vstack(all_magpie_results) if all_magpie_results else np.array([]).reshape(0, 12)
+    sym_arr = np.vstack(all_symmetry_results) if all_symmetry_results else np.array([]).reshape(0, 5)
+    feature_array = np.hstack([magpie_arr, sym_arr])
 
-    # 分批提取：Structure 特征 + Composition 特征
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-
-        # 1. 结构特征（DensityFeatures + GlobalSymmetryFeatures）
-        density_feat.fit(valid_structs)
-        symmetry_feat.fit(valid_structs)
-        density_arr  = density_feat.featurize_many(valid_structs, ignore_errors=True)
-        symmetry_arr = symmetry_feat.featurize_many(valid_structs, ignore_errors=True)
-
-        # 2. 组成特征（ElementProperty 需要 Composition）
-        compositions = [s.composition for s in valid_structs]
-        elem_prop_feat.fit(compositions)
-        elem_arr = elem_prop_feat.featurize_many(compositions, ignore_errors=True)
-
-    # 合并三个 featurizer 的结果
-    feature_array = np.hstack([density_arr, symmetry_arr, elem_arr])
-
-    # 获取特征名（三个 featurizer 拼接）
-    feature_labels = (
-        density_feat.feature_labels()
-        + symmetry_feat.feature_labels()
-        + elem_prop_feat.feature_labels()
-    )
-    print(f"  提取完成: {len(feature_labels)} 个 matminer 特征")
+    magpie_labels = elem_prop_feat.feature_labels()
+    sym_labels = symmetry_feat.feature_labels()
+    feature_labels = magpie_labels + sym_labels
+    print(f"  提取完成: {len(feature_labels)} 个特征（Magpie: {len(magpie_labels)}, Symmetry: {len(sym_labels)}）")
 
     # 构建 DataFrame
-    matminer_df = pd.DataFrame(feature_array, columns=feature_labels, index=valid_indices)
-
-    # 对无效行填充 NaN
+    matminer_df = pd.DataFrame(feature_array, columns=feature_labels, index=all_indices)
     matminer_df = matminer_df.reindex(range(len(df)))
 
     # 数值化 + 中位数填充
