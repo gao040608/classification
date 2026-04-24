@@ -100,10 +100,8 @@ def run_xgboost(df, use_leaky=False, use_pymatgen=True, use_matminer=False):
     print(f"【验证集】 Acc={avg_val_acc:.4f}  Prec={avg_val_prec:.4f}  Rec={avg_val_rec:.4f}  F1={avg_val_f1:.4f}  AUC={avg_val_auc:.4f}")
 
 
-    # 特征重要性排名
-    final_model = get_best_model()
-    final_model.fit(X, y)
-    importances = final_model.feature_importances_
+    # 特征重要性排名（用最后一折验证集的模型）
+    importances = model.feature_importances_
     sorted_idx = np.argsort(importances)[::-1]
     print(f"\n===== XGBoost 特征重要性排名（Top {min(20, len(feature_cols))}）=====")
     for rank, idx in enumerate(sorted_idx[:20], 1):
